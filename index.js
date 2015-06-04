@@ -19,47 +19,98 @@ function connectionKey(conn) {
 /**
  * Enable a server to have a controllable shutdown
  * @param server: the http server
- * @param policy: one of the following:
- *  - 'default': connections are handled according to the following rules:
- *    * in-progress HTTP requests are marked as being the last, so
- *      are responded with Connection: close, and the connection is closed
- *      on completion of the response.
- *    * idle persistent connections that have processed at least one
- *      http request are asynchronously closed immediately
- *    * ws connections are asynchronously closed immediately
- *    * connections that are open, but have not yet had an request started
- *      are held open until either a request is received (in which case they
- *      are then handled according to one of the other rules of this policy)
- *      or are finally abruptly destroyed when the destroy() event on the
- *      server occurs
- *  - 'passive': as for the default policy, with the following exception:
- *    * idle persistent connections that have processed at least one
- *      http request are held open until the next request is received, which
- *      then is marked as the last request. These are responded with
+ * @param options: an object containing options for shutdown:
+ * - policy: one of the following:
+ *    - 'default': connections are handled according to the following rules:
+ *      * in-progress HTTP requests are marked as being the last, so
+ *        are responded with Connection: close, and the connection is closed
+ *        on completion of the response.
+ *      * idle persistent connections that have processed at least one
+ *        http request are asynchronously closed immediately
+ *      * ws connections are asynchronously closed immediately
+ *      * connections that are open, but have not yet had an request started
+ *        are held open until either a request is received (in which case they
+ *        are then handled according to one of the other rules of this policy)
+ *        or are finally abruptly destroyed when the destroy() event on the
+ *        server occurs
+ *    - 'prefer_sync': as for the default policy, but minimising the extent to which
+ *      persistent http connections are closed asynchronously, preferring closing
+ *      synchronously (with Connection:close) at the end of the next request.
+ *      This policy also suports permitting new persistent connections for a short
+ *      grace period, to cope with proxies that are unable to react dynamically to
+ *      this upstream server refusing new connections to service existing client
+ *      connections already implicitly associated with this server. (Hint: nginx)
+ *      Under this policy, any idle persistent connections that have processed at
+ *      least one http request are held open until the next request is received,
+ *      which then is marked as the last request. These are responded with
  *      Connection: close, and the connection is closed on completion of the
  *      response.
- *  - 'abrupt': all connections immediately destroyed when the server is suspended;
+ *    - 'abrupt': all connections immediately destroyed when the server is suspended;
+ *
+ *  - 'closeIdleConnections': the time in millis for which idle persistent http
+ *     connections (under the prefer_sync policy) and uncommitted connections are
+ *     maintained before closing asynchronously
+ *
+ *  - 'allowNewConnections': the time in millis for which new http connections are
+ *     allowed to be created
+ *
+ *  - 'shedWsConnections': the time in millis over which websocket connections are
+ *     closed (to avoid the consequent flood of reconnections if all are closed
+ *     simultaneously)
  */
-function enableDestroy(server, policy) {
-	policy = policy || 'default';
+function enableDestroy(server, options) {
+	var policy = (options && options.policy) || 'default',
+		closeIdleConnections = (options && options.closeIdleConnections) || 0,
+		allowNewConnections = (options && options.allowNewConnections) || 0,
+		shedWsConnections = (options && options.shedWsConnections) || 0,
+		connections = {},
+		wsConnections = {};
 
-	var connections = {}, wsConnections = {};
-
-	server.on('connection', function (conn) {
+	function connectionListener(conn) {
 		var key = connectionKey(conn);
 		connections[key] = conn;
-		conn.on('close', function () {
+		conn.on('close', function() {
 			delete connections[key];
 		});
-	});
+	};
 
-	server.on('upgrade', function(req, conn, upgradeHead) {
+	server.on('connection', connectionListener);
+
+	function upgradeListener(req, conn, upgradeHead) {
 		var key = connectionKey(conn);
 		wsConnections[key] = conn;
-		conn.on('close', function () {
+		conn.on('close', function() {
 			delete wsConnections[key];
 		});
-	});
+	};
+
+	server.on('upgrade', upgradeListener);
+
+	function destroyConnections(connectionIds) {
+		connectionIds.forEach(function(id) {
+			connections[id].destroy();
+		});
+	}
+
+	function shedConnections(connectionIds, interval) {
+		var iterations = 16,
+			connectionsPerIteration = Math.ceil(connectionIds.length / iterations);
+
+		var intervalTimer = setInterval(function() {
+			var connectionsThisIteration;
+			if(--iterations == 0) {
+				clearInterval(intervalTimer);
+				connectionsThisIteration = connectionIds;
+			} else {
+				connectionsThisIteration = connectionIds.splice(0, connectionsPerIteration);
+			}
+			destroyConnections(connectionsThisIteration);
+		}, Math.floor(interval / iterations));
+	}
+
+	function closeListener() {
+		if(server._handle) server.close();
+	}
 
 	/**
 	 * Add a suspend() method to the server which:
@@ -72,63 +123,83 @@ function enableDestroy(server, policy) {
 	 *   request is complete.
 	 * @param cb
 	 */
-	server.suspend = function (cb) {
-		/* stop accepting new connections */
-		if(server._handle)
-			server.close(cb);
+	server.suspend = function() {
 
-		/* process extant connections */
-		var hasUncommittedConnections = false;
-		for (var key in connections) {
-			var connection = connections[key];
+		/*************************
+		 * abrupt policy
+		 *************************/
 
-			/* under the abrupt policy all connections are closed immediately */
-			if(policy == 'abrupt') {
-				connection.destroy();
-				return;
-			}
-
-			/* classify this connection */
-			var serverResponse = connection._httpMessage,
-				isWsConnection = (key in wsConnections),
-				isHTTPConnection = (serverResponse !== undefined),
-				isInProgress = !!serverResponse,
-				isUncommitted = !isWsConnection && !isHTTPConnection;
-
-			/* ws connections are always destroyed immediately */
-			if(isWsConnection) {
-				connection.destroy();
-				return;
-			}
-
-			if(isHTTPConnection) {
-				if(isInProgress) {
-					/* in progress connections are marked as being the end
-					 * of the persistent connection */
-					serverResponse.shouldKeepAlive = false;
-				} else if(policy == 'default') {
-					/* these are idle persistent HTTP connections, which
-					 * are closed now under the default policy */
-					connection.destroy();
-				}
-				return;
-			}
-
-			/* any remaining connection is uncommitted */
-			hasUncommittedConnections = true;
+		if(policy == 'abrupt') {
+			destroyConnections(Object.keys(connections));
+			closeListener();
+			return;
 		}
 
-		if(hasUncommittedConnections) {
-			/* any incoming requests on the uncommitted connections
-			 * must be marked as last */
-			server.on('request', function(req, res) {
-				res.shouldKeepAlive = false;
-			});
+		/*************************
+		 * listener
+		 *************************/
 
-			/* any new ws upgrade requests are terminated */
-			server.on('upgrade', function(req, conn) {
-				conn.destroy();
-			});
+		setTimeout(closeListener, allowNewConnections);
+
+		/*************************
+		 * websocket connections
+		 *************************/
+
+		/* close existing connections */
+		var wsConnectionIds = Object.keys(wsConnections);
+		if(shedWsConnections == 0)
+			destroyConnections(wsConnectionIds);
+		else
+			shedConnections(wsConnectionIds, shedWsConnections);
+
+		/* any new ws upgrade requests are terminated */
+		server.removeListener('upgrade', upgradeListener);
+		server.on('upgrade', function(req, conn) {
+			conn.destroy();
+		});
+
+		/*************************
+		 * HTTP connections
+		 *************************/
+
+		for(var key in connections) {
+			if(key in wsConnections) continue;
+
+			/* if there has never been a server response, it's uncommitted */
+			var connection = connections[key], serverResponse = connection._httpMessage;
+			if(serverResponse === undefined) continue;
+
+			/* handle based on whether or not there is a request in progress */
+			if(serverResponse) {
+				/* in-progress connections are marked as being the end
+				 * of the persistent connection */
+				serverResponse.shouldKeepAlive = false;
+			} else if(policy == 'default') {
+				/* this is an idle persistent HTTP connection, which
+				 * are closed now asynchronously under the default policy */
+				connection.destroy();
+			}
+		}
+
+		/* any incoming requests on uncommitted or new connections
+		 * must be marked as last */
+		server.on('request', function(req, res) {
+			res.shouldKeepAlive = false;
+		});
+
+		/* close existing idle and uncommmitted connections */
+		if(closeIdleConnections > 0) {
+			setTimeout(function() {
+				for(var key in connections) {
+					if(key in wsConnections) continue;
+
+					/* unless there is a request in progress, destroy now */
+					var connection = connections[key], serverResponse = connection._httpMessage;
+					if(!serverResponse) {
+						connection.destroy();
+					}
+				}
+			}, closeIdleConnections);
 		}
 	};
 
@@ -140,9 +211,7 @@ function enableDestroy(server, policy) {
 	 * @param cb
 	 */
 	server.destroy = function (cb) {
-		if (server._handle)
-			server.close(cb);
-		for (var key in connections)
-			connections[key].destroy();
+		closeListener();
+		destroyConnections(Object.keys(connections));
 	};
 }
